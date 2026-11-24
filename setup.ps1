@@ -1,19 +1,33 @@
-# Sets up one side of AudioSwitch.
-#   -Role PC      builds AudioSwitch, installs it to %LOCALAPPDATA%\AudioSwitch and starts it at sign-in.
-#   -Role Laptop  downloads the pinned Audio Over IP release, verifies it and unpacks it to %LOCALAPPDATA%\AudioOverIP.
+# Sets up one side of AudioSwitch. Both roles install under %USERPROFILE%\Tools and start from a per-user logon task.
+#   -Role PC      builds AudioSwitch (switch + receiver) and installs it to %USERPROFILE%\Tools\AudioSwitch.
+#   -Role Laptop  builds the headless Audio Over IP sender from sender/ and installs it to %USERPROFILE%\Tools\AudioOverIP.
+# Not under %LOCALAPPDATA%: when Claude desktop runs this, that path is redirected into its MSIX package folder,
+# where Task Scheduler can't see the files.
 param(
     [Parameter(Mandatory)][ValidateSet('PC', 'Laptop')][string]$Role,
-    [switch]$NoStartup
+    [int]$Port = 8080
 )
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$tools = Join-Path $env:USERPROFILE 'Tools'
 $startup = [Environment]::GetFolderPath('Startup')
 
-function New-Shortcut($path, $target) {
-    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-    $s.TargetPath = $target
-    $s.WorkingDirectory = Split-Path -Parent $target
-    $s.Save()
+function Register-LogonTask($name, $exe, $arguments) {
+    $action = if ($arguments) { New-ScheduledTaskAction -Execute $exe -Argument $arguments -WorkingDirectory (Split-Path $exe) }
+              else { New-ScheduledTaskAction -Execute $exe -WorkingDirectory (Split-Path $exe) }
+    $user = "$env:USERDOMAIN\$env:USERNAME"
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
+    # Task Scheduler's restart-on-failure only covers a failed launch, not a crash or a non-zero exit.
+    # A once-a-minute repeat with IgnoreNew restarts the program within a minute and is a no-op while it runs.
+    $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+    $trigger = @($logon, $watchdog)
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $name
+    "Registered and started scheduled task '$name'"
 }
 
 if ($Role -eq 'PC') {
@@ -26,36 +40,27 @@ if ($Role -eq 'PC') {
 
     & (Join-Path $here 'build.ps1')
 
-    $dest = Join-Path $env:LOCALAPPDATA 'AudioSwitch'
-    Get-Process AudioSwitch -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dest\*" } | Stop-Process -Force
+    $dest = Join-Path $tools 'AudioSwitch'
+    Get-Process AudioSwitch -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Milliseconds 500
     New-Item -ItemType Directory -Force (Join-Path $dest 'local') | Out-Null
     Copy-Item (Join-Path $here 'bin\AudioSwitch.exe'), (Join-Path $here 'bin\NAudio.dll') $dest -Force
     Copy-Item $config (Join-Path $dest 'local\network.json') -Force
 
-    if (-not $NoStartup) { New-Shortcut (Join-Path $startup 'AudioSwitch.lnk') (Join-Path $dest 'AudioSwitch.exe') }
-    Start-Process (Join-Path $dest 'AudioSwitch.exe') -WorkingDirectory $dest
-    "Installed and started $dest\AudioSwitch.exe"
+    $oldHotkey = Join-Path $env:LOCALAPPDATA 'AudioSwitch\hotkey.txt'
+    if ((Test-Path $oldHotkey) -and -not (Test-Path (Join-Path $dest 'hotkey.txt'))) { Copy-Item $oldHotkey $dest }
+    Remove-Item (Join-Path $startup 'AudioSwitch.lnk') -ErrorAction SilentlyContinue
+
+    Register-LogonTask 'AudioSwitch' (Join-Path $dest 'AudioSwitch.exe') $null
 }
 else {
-    $version = 'v0.9.0.1'
-    $size = 5601036
-    $sha256 = '10C1A2D3A55344EBE89CBFCD7CB2C4B140477C7706A7F9BB2CB44814AA022E1B'
-    $url = "https://github.com/ElTheLedge/Audio-Over-IP/releases/download/$version/AudioOverIP_release-Windows_x64.zip"
+    $dest = Join-Path $tools 'AudioOverIP'
+    Get-Process AudioOverIP-headless -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Milliseconds 500
+    & (Join-Path $here 'sender\build-sender.ps1') -OutDir $dest
+    if (-not (Test-Path (Join-Path $dest 'AudioOverIP-headless.exe'))) { throw 'Sender build failed.' }
 
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aoip-" + [guid]::NewGuid())
-    New-Item -ItemType Directory $tmp | Out-Null
-    $zip = Join-Path $tmp 'AudioOverIP.zip'
-    Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
-    $len = (Get-Item $zip).Length
-    $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
-    if ($len -ne $size -or $hash -ne $sha256) { throw "Audio Over IP download mismatch: size $len, SHA-256 $hash" }
-
-    $dest = Join-Path $env:LOCALAPPDATA 'AudioOverIP'
-    Expand-Archive $zip $dest -Force
-    Remove-Item $tmp -Recurse -Force
-
-    if (-not $NoStartup) { New-Shortcut (Join-Path $startup 'AudioOverIP.lnk') (Join-Path $dest 'AudioOverIP.exe') }
-    "Unpacked Audio Over IP $version to $dest"
-    "Open it, go to the Sender tab and press Start. It listens on TCP 8080 and has to be started after every launch."
+    Remove-Item (Join-Path $startup 'AudioOverIP.lnk') -ErrorAction SilentlyContinue
+    Register-LogonTask 'Audio Over IP sender (headless)' (Join-Path $dest 'AudioOverIP-headless.exe') "-port $Port"
+    "The sender listens on TCP $Port. Logs: %APPDATA%\ElTheLedge\AudioOverIP\logs\headless-server.log"
 }
