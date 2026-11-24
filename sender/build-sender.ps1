@@ -33,7 +33,8 @@ try {
     New-Item -ItemType Directory -Force $OutDir | Out-Null
     $env:CGO_ENABLED = '0'
     Push-Location $src
-    try { & $go build -tags headless -trimpath -ldflags '-s -w' -o (Join-Path $OutDir 'AudioOverIP-headless.exe') . }
+    # -H windowsgui: no console window when Task Scheduler starts it. Logging goes to a file anyway.
+    try { & $go build -tags headless -trimpath -ldflags '-s -w -H windowsgui' -o (Join-Path $OutDir 'AudioOverIP-headless.exe') . }
     finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { throw "go build failed for $Tag" }
     Copy-Item (Join-Path $src 'LICENSE') (Join-Path $OutDir 'LICENSE-EUPL-1.2.txt') -Force
