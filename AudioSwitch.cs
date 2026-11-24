@@ -274,6 +274,102 @@ namespace AudioSwitch
             try { File.WriteAllText(PrefsPath, "notifications=" + (notifications ? "1" : "0") + Environment.NewLine); } catch { }
         }
 
+        // ---- receive-side muting ----
+        // While we play the peer's stream, every other session on our default output is muted so the speakers
+        // carry exactly one source. Nothing captures on the receiving side, so per-session mute is safe here.
+        // What we muted is recorded in rx-muted.txt (session identifier | process) so a crash or restart can
+        // put it back. Sessions that were already muted are the user's and are never touched.
+        readonly Dictionary<string, string> rxMuted = new Dictionary<string, string>();
+        readonly uint myPid = (uint)Process.GetCurrentProcess().Id;
+        string RxFile { get { return Path.Combine(dir, "rx-muted.txt"); } }
+
+        static IEnumerable<AudioSessionControl> RenderSessions()
+        {
+            var mgr = new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Console).AudioSessionManager;
+            mgr.RefreshSessions();
+            var all = mgr.Sessions;
+            for (int i = 0; i < all.Count; i++) yield return all[i];
+        }
+
+        static string ProcName(uint pid)
+        {
+            if (pid == 0) return "system";
+            try { return Process.GetProcessById((int)pid).ProcessName; } catch { return "?"; }
+        }
+
+        void MuteOthers()
+        {
+            bool changed = false;
+            try
+            {
+                foreach (var s in RenderSessions())
+                {
+                    uint pid = s.GetProcessID;
+                    if (pid == myPid) continue;
+                    string name = ProcName(pid);
+                    if (name == "AudioOverIP-headless") continue;
+                    string id = s.GetSessionIdentifier;
+                    if (string.IsNullOrEmpty(id) || rxMuted.ContainsKey(id)) continue;
+                    if (s.SimpleAudioVolume.Mute) continue;
+                    s.SimpleAudioVolume.Mute = true;
+                    rxMuted[id] = name;
+                    changed = true;
+                    Log("rx: muted " + name + " (pid " + pid + ")");
+                }
+            }
+            catch (Exception e) { Log("rx: mute failed: " + e.Message); }
+            if (changed) SaveRxMuted();
+        }
+
+        void RestoreOthers(string why)
+        {
+            if (rxMuted.Count == 0) return;
+            try
+            {
+                foreach (var s in RenderSessions())
+                {
+                    string id = s.GetSessionIdentifier;
+                    if (id != null && rxMuted.ContainsKey(id) && s.SimpleAudioVolume.Mute) s.SimpleAudioVolume.Mute = false;
+                }
+            }
+            catch (Exception e) { Log("rx: restore failed: " + e.Message); }
+            Log("rx: restored " + rxMuted.Count + " session(s): " + string.Join(", ", rxMuted.Values.Distinct().ToArray()) + " (" + why + ")");
+            rxMuted.Clear();
+            SaveRxMuted();
+        }
+
+        void SaveRxMuted()
+        {
+            try
+            {
+                if (rxMuted.Count == 0) { File.Delete(RxFile); return; }
+                File.WriteAllLines(RxFile, rxMuted.Select(kv => kv.Key + "|" + kv.Value).ToArray());
+            }
+            catch { }
+        }
+
+        void RestoreRxAfterCrash()
+        {
+            try
+            {
+                if (!File.Exists(RxFile)) return;
+                foreach (var line in File.ReadAllLines(RxFile))
+                {
+                    int bar = line.LastIndexOf('|');
+                    if (bar > 0) rxMuted[line.Substring(0, bar)] = line.Substring(bar + 1);
+                }
+                RestoreOthers("left over from a previous run");
+            }
+            catch { }
+        }
+
+        void ApplyRx()
+        {
+            bool rx = receiver != null && receiver.Feed && !sending;
+            if (rx) MuteOthers();
+            else RestoreOthers(sending ? "we started sending" : "left receive mode");
+        }
+
         void Notify(int ms, string title, string text, ToolTipIcon icon)
         {
             Log("notice: " + text);
@@ -312,6 +408,7 @@ namespace AudioSwitch
             recvIcon = MakeIcon(Color.FromArgb(16, 137, 62), "RX");
 
             RestoreEndpointAfterCrash();
+            RestoreRxAfterCrash();
             LoadHotkey();
             LoadPrefs();
 
@@ -426,6 +523,7 @@ namespace AudioSwitch
                 if (receiver.Connected)
                 {
                     SetFeed(true, "peer says SENDING 1 from " + remote);
+                    invoker.BeginInvoke((MethodInvoker)delegate { ApplyRx(); UpdateUi(); });
                     // Only one side sends at a time: two senders would loop each other's audio back and forth.
                     if (sending) invoker.BeginInvoke((MethodInvoker)delegate { GoLocal(false, "Peer is sending to you, so your audio plays here again"); });
                     reply = "OK receiver=connected";
@@ -435,6 +533,7 @@ namespace AudioSwitch
             else if (line == "SENDING 0")
             {
                 SetFeed(false, "peer says SENDING 0");
+                if (rxMuted.Count > 0) invoker.BeginInvoke((MethodInvoker)delegate { ApplyRx(); UpdateUi(); });
                 reply = "OK";
             }
             else if (line == "TOGGLE")
@@ -478,6 +577,7 @@ namespace AudioSwitch
             sending = true;
             Log("mode SENDING (endpoint muted)");
             MuteEndpoint(true);
+            ApplyRx();
             Notify(1000, "Audio", "Sending your audio to the peer", ToolTipIcon.None);
             UpdateUi();
         }
@@ -562,6 +662,7 @@ namespace AudioSwitch
             if (receiver != null && receiver.Feed &&
                 DateTime.UtcNow.Ticks - Interlocked.Read(ref lastPeerMsgTicks) > TimeSpan.FromSeconds(15).Ticks)
                 SetFeed(false, "no word from peer for 15 s");
+            ApplyRx();
             UpdateUi();
         }
 
@@ -596,6 +697,7 @@ namespace AudioSwitch
                     " hotkey=" + hkName + (hk.Registered ? " ok" : " FAILED") + " pull=" + NameOf(HotKeyWindow.PullMod(hkMod), hkVk) +
                     " receiver=[" + ReceiverStatus + "] bytes=" + (receiver != null ? Interlocked.Read(ref receiver.Bytes) : 0) +
                     " peer-control=[" + peerState + "] endpoint-muted=" + (mutedDeviceId != null ? "yes" : "no") +
+                    " rx-muted=" + rxMuted.Count +
                     " time=" + DateTime.Now.ToString("s"));
             }
             catch { }
@@ -712,7 +814,8 @@ namespace AudioSwitch
                 MuteEndpoint(false);
                 if (peerHost != null) PeerLink.Ask(peerHost, peerControlPort, "SENDING 0");
             }
-            if (receiver != null) receiver.Stop();
+            if (receiver != null) { receiver.Feed = false; receiver.Stop(); }
+            RestoreOthers("exit");
             if (listener != null) { try { listener.Stop(); } catch { } }
             hk.Dispose();
             ni.Visible = false;

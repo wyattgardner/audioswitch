@@ -10,6 +10,8 @@ param(
     [string]$PeerHost,
     [int]$Port = 8080,
     [int]$ControlPort = 8091,
+    # Push hotkey for this machine, e.g. F13 or Ctrl+Alt+F9. Shift plus it becomes pull. Default F13.
+    [string]$Hotkey,
     [switch]$SkipFirewall
 )
 $ErrorActionPreference = 'Stop'
@@ -79,6 +81,22 @@ Copy-Item (Join-Path $here 'bin\AudioSwitch.exe'), (Join-Path $here 'bin\NAudio.
 Copy-Item $config (Join-Path $switchDir 'local\network.json') -Force
 $oldHotkey = Join-Path $env:LOCALAPPDATA 'AudioSwitch\hotkey.txt'
 if ((Test-Path $oldHotkey) -and -not (Test-Path (Join-Path $switchDir 'hotkey.txt'))) { Copy-Item $oldHotkey $switchDir }
+if ($Hotkey) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $mod = 0; $key = $null
+    foreach ($part in $Hotkey.Split('+') | ForEach-Object { $_.Trim() }) {
+        switch -Regex ($part) {
+            '^(ctrl|control)$' { $mod = $mod -bor 2 }
+            '^alt$'            { $mod = $mod -bor 1 }
+            '^shift$'          { $mod = $mod -bor 4 }
+            '^win$'            { $mod = $mod -bor 8 }
+            default            { $key = $part }
+        }
+    }
+    $vk = [int][System.Windows.Forms.Keys]::Parse([System.Windows.Forms.Keys], $key, $true)
+    Set-Content (Join-Path $switchDir 'hotkey.txt') "$mod,$vk" -Encoding ASCII
+    "Hotkey: $Hotkey (pull: Shift toggled on the same key)"
+}
 Remove-Item (Join-Path $startup 'AudioSwitch.lnk') -ErrorAction SilentlyContinue
 
 # ---- firewall: inbound sender and control ports, from the peer only ----

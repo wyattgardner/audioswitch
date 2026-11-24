@@ -16,7 +16,9 @@ Both start on their own at sign-in.
 | **F13** | Toggle: send my audio to the other machine, or play it here again |
 | **Shift+F13** | Pull: ask the other machine to toggle sending its audio here |
 
-- While a machine is sending, its own speakers are muted at the endpoint and the other machine plays its stream mixed with its own audio. Loopback capture is taken before endpoint mute, so the stream stays at full level.
+- Each machine's speakers play exactly one source:
+  - **Sending:** the machine's own speakers are muted at the endpoint. Loopback capture is taken before endpoint mute, so the stream stays at full level.
+  - **Receiving:** every other app on the machine's default output is muted, polled every second so apps that start later are caught too, and only the other machine's stream plays. Exactly those sessions are restored when it stops receiving. What was muted is recorded in `rx-muted.txt`, so a crash or restart restores it on the next start. Sessions you had already muted yourself are never touched.
 - Only one machine sends at a time. If the other one starts sending, this one goes back to playing locally. Two senders would loop each other's audio back and forth.
 - Sending only starts if the other AudioSwitch answers and is connected to this machine's sender. Otherwise you get a balloon and the audio stays put. If the other machine disappears while you're sending, this machine goes back to local after about 15 seconds.
 - Tray icon: blue **LO** (playing locally), orange **TX** (sending), green **RX** (playing the other machine's audio). Left-click = F13. Right-click has the same actions, **Preferences** and **Exit**.
@@ -43,7 +45,7 @@ Setup does the following:
 
 Everything installs under `%USERPROFILE%\Tools`, not `%LOCALAPPDATA%`, because when Claude desktop runs a script `%LOCALAPPDATA%` is redirected into its own package folder, out of Task Scheduler's sight.
 
-Options: `-Port` (sender, default 8080), `-ControlPort` (default 8091), `-SkipFirewall`.
+Options: `-Hotkey` (this machine's push key, e.g. `F13` or `Ctrl+Alt+F9`; Shift plus it becomes pull; default F13), `-Port` (sender, default 8080), `-ControlPort` (default 8091), `-SkipFirewall`. Use `-Hotkey` on a machine whose keyboard has no F13. Left-clicking the tray icon always works as a fallback.
 
 ## Checking it works
 
