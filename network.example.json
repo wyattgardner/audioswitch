@@ -1,0 +1,13 @@
+{
+  "laptop": {
+    "hostname": "LAPTOP-NAME",
+    "host": "192.0.2.20",
+    "port": 8080,
+    "mac": "00-00-5E-00-53-02"
+  },
+  "pc": {
+    "hostname": "PC-NAME",
+    "host": "192.0.2.10",
+    "mac": "00-00-5E-00-53-01"
+  }
+}

@@ -1,41 +1,57 @@
 # AudioSwitch
 
-A tiny Windows tray app that switches which of two computers you hear through one set of speakers, using a single hotkey.
+A small Windows tray app that lets one set of speakers or headphones play either your PC or a second computer (say, a work laptop) on the same LAN, toggled with one hotkey.
 
-It pairs with [Scream](https://github.com/duncanthrax/scream), a virtual audio driver that streams a PC's audio over the LAN. Computer A (the one with the speakers) runs AudioSwitch and ScreamReader. Computer B runs the Scream driver and sends its audio to A.
+The laptop runs [Audio Over IP](https://github.com/ElTheLedge/Audio-Over-IP) in Sender mode. It captures system audio with WASAPI loopback, so no driver is needed, which matters on locked-down work machines. The PC runs AudioSwitch, which has its own Audio Over IP receiver built in.
 
 ## How it works
 
-- AudioSwitch launches `ScreamReader.exe`, which plays Scream's network audio through A's default output.
-- The hotkey toggles between two modes by muting and unmuting per-app sessions in the Windows mixer (Core Audio session API):
-  - **PC mode:** ScreamReader is muted, everything else on A plays.
-  - **Laptop mode:** every app except ScreamReader is muted. New apps are muted within a second.
-- Tray icon: blue "PC" or orange "LT". Left-click toggles. Right-click has **Set hotkey...** and **Exit**.
-- Exit unmutes everything it muted and closes ScreamReader.
+- AudioSwitch connects to the sender (`GET /getAudioConfig`, then raw float32 PCM over the `/audio` websocket) and reconnects every few seconds if the laptop goes away.
+- The hotkey toggles two modes:
+  - **PC mode:** laptop audio is dropped and PC apps play normally.
+  - **Laptop mode:** laptop audio plays and every other app on the PC's default output is muted in the Windows mixer. Apps started later are muted within a second.
+- Latency is capped at about 150 ms. If the network backs up, the buffer is flushed instead of drifting.
+- The tray icon is a blue "PC" or orange "LT". Left-click toggles. Right-click has **Set hotkey...** and **Exit**. The tooltip shows the connection status.
+- Exit unmutes everything AudioSwitch muted.
 
-No network code, no admin rights, no driver on A. One source file, no dependencies beyond the .NET Framework that ships with Windows.
+AudioSwitch only touches session mute flags. It never changes volume levels.
 
-## Build
+## Setup
+
+### Laptop (sender)
 
 ```powershell
-./build.ps1
+./setup.ps1 -Role Laptop
 ```
 
-This compiles `AudioSwitch.cs` with the built-in `csc.exe` into `AudioSwitch.exe`.
+This downloads the pinned Audio Over IP release (v0.9.0.1), checks its size and SHA-256, unpacks it to `%LOCALAPPDATA%\AudioOverIP` and adds it to sign-in startup. Open it, go to the **Sender** tab and press **Start**. It listens on TCP 8080. It doesn't remember being started, so this has to be done after every launch.
 
-## Install
+Audio Over IP is EUPL-1.2 licensed. This repo doesn't include or modify its code, it just downloads the official release.
 
-1. Download `Scream4.0.zip` from the [Scream releases](https://github.com/duncanthrax/scream/releases/tag/4.0).
-2. Copy `Install\clients\Windows\ScreamReader\` (ScreamReader.exe and NAudio.dll) into a `ScreamReader` folder next to `AudioSwitch.exe`.
-3. Run `AudioSwitch.exe`. Allow ScreamReader through Windows Firewall on private networks (UDP 4010).
-4. On computer B, run the Scream driver installer (`Install-x64.bat`, as admin) and set **Speakers (Scream)** as its default output.
-5. Default hotkey is Ctrl+Alt+F9. Use **Set hotkey...** in the tray menu to bind any key, for example an F13 to F24 key from a remapped keyboard. The choice is saved next to the exe in `hotkey.txt`.
+### PC (receiver and switch)
 
-If multicast is blocked on your network, set the Scream driver to unicast: add a string value `UnicastIPv4` with computer A's IP under `HKLM\SYSTEM\CurrentControlSet\Services\Scream\Options`, then disable and re-enable the Scream device.
+1. Copy `network.example.json` to `local/network.json` and fill in the laptop's address. `local/` is git-ignored, so real addresses never get committed.
+2. Run:
+
+   ```powershell
+   ./setup.ps1 -Role PC
+   ```
+
+   This downloads NAudio 1.10.0 from NuGet (hash pinned), builds `AudioSwitch.exe` with the C# compiler that ships with Windows, installs it to `%LOCALAPPDATA%\AudioSwitch`, adds it to sign-in startup and starts it.
+3. The default hotkey is Ctrl+Alt+F9. **Set hotkey...** binds any key, for example an F13 to F24 key from a remapped keyboard. The choice is saved next to the exe in `hotkey.txt`.
+
+To rebuild without installing, run `./build.ps1`. The output goes to `bin/`.
+
+## Troubleshooting
+
+- The tooltip or `%LOCALAPPDATA%\AudioSwitch\state.txt` shows the receiver status.
+- "Actively refused": the sender isn't started on the laptop, or a firewall blocks TCP 8080. From the PC, check with `Test-NetConnection <laptop-ip> -Port 8080`.
+- Connected but silent: the sender captures the laptop's default output device, so make sure the laptop plays to a real device.
+- Give both machines DHCP reservations so the address in `local/network.json` doesn't change.
 
 ## Notes
 
 - Windows only. Tested on Windows 11.
+- The stream isn't encrypted. Keep it on a trusted LAN.
+- AudioSwitch plays to the PC's default output device as it was when the connection started.
 - The exe is unsigned, so SmartScreen or antivirus may complain.
-- ScreamReader plays through the default output device. Changing the default device while running works, but apps already muted on the old device stay muted until you switch modes.
-- Only the audio session mute flag is touched. Volume levels are never changed.
