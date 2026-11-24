@@ -1,73 +1,80 @@
 # AudioSwitch
 
-A small Windows tray app that lets one set of speakers or headphones play either your PC or a second computer (say, a work laptop) on the same LAN, toggled with one hotkey.
+Send audio between two Windows machines on the same LAN, in either direction, with one hotkey. For example, a personal PC and a work laptop, each with its own speakers: press F13 on either one to play its audio through the other's speakers instead.
 
-The laptop runs a headless build of [Audio Over IP](https://github.com/ElTheLedge/Audio-Over-IP) as the sender. It captures system audio with WASAPI loopback, so no driver is needed, which matters on locked-down work machines. The PC runs AudioSwitch, which has its own Audio Over IP receiver built in. Both start on their own at sign-in.
+Each machine runs the same two pieces:
 
-## How it works
+- a headless build of [Audio Over IP](https://github.com/ElTheLedge/Audio-Over-IP) that shares the machine's system audio over the LAN. It uses WASAPI loopback, so no driver is needed, which matters on locked-down work machines.
+- AudioSwitch, a tray app that plays the other machine's audio, handles the hotkeys, and coordinates with the other AudioSwitch.
 
-- AudioSwitch connects to the sender (`GET /getAudioConfig`, then raw float32 PCM over the `/audio` websocket) and reconnects every few seconds if the laptop goes away.
-- The hotkey toggles two modes:
-  - **PC mode:** laptop audio is dropped and PC apps play normally.
-  - **Laptop mode:** laptop audio plays and every other app on the PC's default output is muted in the Windows mixer. Apps started later are muted within a second.
-- Latency is capped at about 150 ms. If the network backs up, the buffer is flushed instead of drifting.
-- The tray icon is a blue "PC" or orange "LT". Left-click toggles. Right-click has **Set hotkey...** and **Exit**. The tooltip shows the connection status.
-- Exit unmutes everything AudioSwitch muted.
+Both start on their own at sign-in.
 
-AudioSwitch only touches session mute flags. It never changes volume levels.
+## Switching
+
+| Key | On the machine where you press it |
+| --- | --- |
+| **F13** | Toggle: send my audio to the other machine, or play it here again |
+| **Shift+F13** | Pull: ask the other machine to toggle sending its audio here |
+
+- While a machine is sending, its own speakers are muted at the endpoint and the other machine plays its stream mixed with its own audio. Loopback capture is taken before endpoint mute, so the stream stays at full level.
+- Only one machine sends at a time. If the other one starts sending, this one goes back to playing locally. Two senders would loop each other's audio back and forth.
+- Sending only starts if the other AudioSwitch answers and is connected to this machine's sender. Otherwise you get a balloon and the audio stays put. If the other machine disappears while you're sending, this machine goes back to local after about 15 seconds.
+- Tray icon: blue **LO** (playing locally), orange **TX** (sending), green **RX** (playing the other machine's audio). Left-click = F13. Right-click has the same actions plus **Set hotkey...** (Shift+your key becomes pull) and **Exit**.
+- Exit, or a crash followed by restart, unmutes anything AudioSwitch muted.
+
+## Install (on each machine)
+
+Needs git, Go 1.26 or later, and Windows' built-in .NET Framework 4.x.
+
+```powershell
+git clone https://github.com/wyattgardner/audioswitch.git
+cd audioswitch
+./setup.ps1 -PeerHost <the other machine's IP>
+```
+
+Setup does the following:
+
+1. Writes `local/network.json` with the other machine's address. `local/` is git-ignored, so real addresses never get committed. Later runs reuse it, so plain `./setup.ps1` is enough.
+2. Builds the headless sender from the pinned upstream release plus `sender/headless.patch`, and installs it to `%USERPROFILE%\Tools\AudioOverIP`.
+3. Builds AudioSwitch (NAudio 1.10.0 from NuGet, hash pinned) and installs it to `%USERPROFILE%\Tools\AudioSwitch`.
+4. Adds inbound firewall rules for TCP 8080 (sender) and 8091 (AudioSwitch control), from the other machine's address only. This step asks for admin. If it's declined, setup prints the command to run.
+5. Registers two per-user logon tasks, "Audio Over IP sender (headless)" and "AudioSwitch". A once-a-minute repeat with "ignore new instance" restarts either one within a minute if it dies.
+
+Everything installs under `%USERPROFILE%\Tools`, not `%LOCALAPPDATA%`, because when Claude desktop runs a script `%LOCALAPPDATA%` is redirected into its own package folder, out of Task Scheduler's sight.
+
+Options: `-Port` (sender, default 8080), `-ControlPort` (default 8091), `-SkipFirewall`.
+
+## Checking it works
+
+- **AudioSwitch state:** `%USERPROFILE%\Tools\AudioSwitch\state.txt`, refreshed every second. You want `receiver=[connected ...]` with `bytes=` growing, and `peer-control=[ok]` once the other machine is set up. `mode=` shows LOCAL, SENDING or RECEIVING.
+- **Sender log:** `%APPDATA%\ElTheLedge\AudioOverIP\logs\headless-server.log`. It logs the playback device it captures, each client that connects, and "no active playback device" if there's nothing to capture.
+- **From the other machine:** `Test-NetConnection <ip> -Port 8080` and `-Port 8091` should both succeed.
+
+| Symptom | Likely cause |
+| --- | --- |
+| `receiver=[offline: ... actively refused]` | The other machine's sender isn't running, or its firewall blocks 8080 |
+| `receiver=[sender error 500 ...]` | The other machine has no active playback device |
+| `peer-control=[unreachable]` | The other AudioSwitch isn't running, or its firewall blocks 8091 |
+| Connected but silent | The sending machine plays to a device other than its default, or nothing is playing |
 
 ## Layout
 
 | Path | What | License |
 | --- | --- | --- |
-| `AudioSwitch.cs`, `build.ps1`, `setup.ps1` | Tray app with receiver, build and setup scripts | MIT |
-| `sender/` | Patch that adds a headless sender to Audio Over IP, plus build and upstream-check scripts. See [sender/README.md](sender/README.md). | EUPL-1.2 |
-| `network.example.json` | Template for `local/network.json` (git-ignored) | MIT |
+| `AudioSwitch.cs`, `build.ps1`, `setup.ps1` | Tray app, build and setup scripts | MIT |
+| `sender/` | Patch adding a headless sender to Audio Over IP, plus build and upstream-check scripts. See [sender/README.md](sender/README.md). | EUPL-1.2 |
+| `network.example.json` | Shape of `local/network.json` | MIT |
 
-## Setup
-
-Both roles install under `%USERPROFILE%\Tools` and register a per-user scheduled task. It starts the program at sign-in and, via a once-a-minute repeat that does nothing while the program runs, restarts it within a minute if it dies. The install isn't under `%LOCALAPPDATA%`, because when Claude desktop runs a script that path is redirected into its own package folder, out of Task Scheduler's sight.
-
-### Laptop (sender)
-
-Needs Go 1.26 or later and git.
-
-```powershell
-./setup.ps1 -Role Laptop          # optional: -Port 8080
-```
-
-This builds `AudioOverIP-headless.exe` from the pinned upstream release plus `sender/headless.patch`, installs it with its EUPL license to `%USERPROFILE%\Tools\AudioOverIP`, removes any old GUI startup shortcut, and registers the task "Audio Over IP sender (headless)". Logs go to `%APPDATA%\ElTheLedge\AudioOverIP\logs\headless-server.log`.
-
-### PC (receiver and switch)
-
-1. Copy `network.example.json` to `local/network.json` and fill in the laptop's address. `local/` is git-ignored, so real addresses never get committed.
-2. Run:
-
-   ```powershell
-   ./setup.ps1 -Role PC
-   ```
-
-   This downloads NAudio 1.10.0 from NuGet (hash pinned), builds `AudioSwitch.exe` with the C# compiler that ships with Windows, installs it to `%USERPROFILE%\Tools\AudioSwitch` and registers the task "AudioSwitch".
-3. The default hotkey is Ctrl+Alt+F9. **Set hotkey...** binds any key, for example an F13 to F24 key from a remapped keyboard. The choice is saved next to the exe in `hotkey.txt`.
-
-To rebuild without installing, run `./build.ps1` (output in `bin/`) or `./sender/build-sender.ps1` (output in `sender/bin/`).
+Audio Over IP is by ElTheLedge and licensed EUPL-1.2. This repo stores only the patch, never upstream source or binaries.
 
 ## Upstream updates
 
-`sender/check-upstream.ps1` test-builds the patch against the newest Audio Over IP release. A weekly GitHub Action (`.github/workflows/upstream-check.yml`) runs it and opens an issue when a new release shows up.
-
-## Troubleshooting
-
-- The tooltip or `%USERPROFILE%\Tools\AudioSwitch\state.txt` shows the receiver status.
-- "Actively refused": the sender isn't running on the laptop. Check the task and its log. From the PC: `Test-NetConnection <laptop-ip> -Port 8080`.
-- HTTP 500 from `/getAudioConfig`: the sender was built without the COM fix in `sender/headless.patch`.
-- Connected but silent: the sender captures the laptop's default output device, so make sure the laptop plays to a real device.
-- Give both machines DHCP reservations so the address in `local/network.json` doesn't change.
+`sender/check-upstream.ps1` test-builds the patch against the newest Audio Over IP release. A weekly GitHub Action runs it and opens an issue when a new release shows up.
 
 ## Notes
 
 - Windows only. Tested on Windows 11.
-- The stream isn't encrypted. Keep it on a trusted LAN.
-- AudioSwitch plays to the PC's default output device as it was when the connection started.
-- Quitting from the tray menu lasts until the watchdog restarts it, within a minute. To stop it for good, disable the scheduled task.
-- The exe is unsigned, so SmartScreen or antivirus may complain.
+- The stream and the control channel aren't encrypted or authenticated beyond "comes from the configured peer address". Keep it on a trusted LAN.
+- Received audio plays on the receiving machine's default output device as it was when the connection started.
+- Quitting from the tray lasts until the watchdog restarts it, within a minute. To stop it for good, disable the scheduled tasks.
+- The exes are unsigned, so SmartScreen or antivirus may complain.

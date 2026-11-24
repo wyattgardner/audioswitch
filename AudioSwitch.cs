@@ -3,9 +3,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Net;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -34,7 +37,8 @@ namespace AudioSwitch
     {
         [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
         [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
-        public event EventHandler Pressed;
+        public const int Push = 1, Pull = 2;
+        public event Action<int> Pressed;
         public bool Registered;
 
         public HotKeyWindow(uint mod, uint vk)
@@ -43,42 +47,28 @@ namespace AudioSwitch
             Rebind(mod, vk);
         }
 
+        public static uint PullMod(uint mod) { return mod ^ 0x0004; }
+
         public bool Rebind(uint mod, uint vk)
         {
-            UnregisterHotKey(Handle, 1);
-            Registered = RegisterHotKey(Handle, 1, mod | 0x4000, vk);
+            UnregisterHotKey(Handle, Push);
+            UnregisterHotKey(Handle, Pull);
+            Registered = RegisterHotKey(Handle, Push, mod | 0x4000, vk);
+            if (Registered) RegisterHotKey(Handle, Pull, PullMod(mod) | 0x4000, vk);
             return Registered;
         }
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == 0x0312 && Pressed != null) Pressed(this, EventArgs.Empty);
+            if (m.Msg == 0x0312 && Pressed != null) Pressed((int)m.WParam);
             base.WndProc(ref m);
         }
 
         public void Dispose()
         {
-            UnregisterHotKey(Handle, 1);
+            UnregisterHotKey(Handle, Push);
+            UnregisterHotKey(Handle, Pull);
             DestroyHandle();
-        }
-    }
-
-    static class Sessions
-    {
-        public delegate void SessionVisitor(uint pid, SimpleAudioVolume vol);
-
-        public static void ForEach(SessionVisitor visit)
-        {
-            var dev = new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
-            var mgr = dev.AudioSessionManager;
-            mgr.RefreshSessions();
-            var sessions = mgr.Sessions;
-            for (int i = 0; i < sessions.Count; i++)
-            {
-                var c = sessions[i];
-                if (c.IsSystemSoundsSession) continue;
-                visit(c.GetProcessID, c.SimpleAudioVolume);
-            }
         }
     }
 
@@ -101,6 +91,8 @@ namespace AudioSwitch
             this.host = host;
             this.port = port;
         }
+
+        public bool Connected { get { return Status.StartsWith("connected"); } }
 
         public void Start()
         {
@@ -182,7 +174,7 @@ namespace AudioSwitch
                     var http = inner as WebException;
                     var resp = http != null ? http.Response as HttpWebResponse : null;
                     if (resp != null && (int)resp.StatusCode == 500)
-                        Status = "sender error 500: laptop has no active playback device?";
+                        Status = "sender error 500: peer has no active playback device?";
                     else
                         Status = "offline: " + inner.Message;
                 }
@@ -198,6 +190,31 @@ namespace AudioSwitch
         }
     }
 
+    // One-line text protocol between the two AudioSwitch instances on TCP controlPort:
+    //   SENDING 1|0  the peer started or stopped sending its audio to us. Replies "OK receiver=connected|offline".
+    //   TOGGLE       the peer asks us to toggle sending our audio to it (pull). Replies "OK".
+    static class PeerLink
+    {
+        public static string Ask(string host, int port, string line)
+        {
+            try
+            {
+                using (var c = new TcpClient())
+                {
+                    var ar = c.BeginConnect(host, port, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(1500)) return null;
+                    c.EndConnect(ar);
+                    var s = c.GetStream();
+                    s.ReadTimeout = 2000;
+                    var b = Encoding.ASCII.GetBytes(line + "\n");
+                    s.Write(b, 0, b.Length);
+                    return new StreamReader(s, Encoding.ASCII).ReadLine();
+                }
+            }
+            catch { return null; }
+        }
+    }
+
     class TrayContext : ApplicationContext
     {
         [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, LowLevelProc p, IntPtr mod, uint tid);
@@ -207,8 +224,8 @@ namespace AudioSwitch
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
         delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
 
-        uint hkMod = 0x0003, hkVk = 0x78;
-        string hkName = "Ctrl+Alt+F9";
+        uint hkMod = 0, hkVk = 0x7C;
+        string hkName = "F13";
         LowLevelProc hookProc;
         IntPtr hookHandle = IntPtr.Zero;
         Timer captureTimeout = new Timer();
@@ -217,55 +234,78 @@ namespace AudioSwitch
         NotifyIcon ni = new NotifyIcon();
         Timer timer = new Timer();
         HotKeyWindow hk;
-        bool laptop;
-        HashSet<uint> ours = new HashSet<uint>();
-        Icon pcIcon, ltIcon;
+        Control invoker = new Control();
+        Icon localIcon, sendIcon, recvIcon;
         string dir = AppDomain.CurrentDomain.BaseDirectory;
-        uint myPid = (uint)Process.GetCurrentProcess().Id;
+
         Receiver receiver;
         string configError = "";
+        string peerHost;
+        int peerControlPort = 8091, controlPort = 8091;
+        TcpListener listener;
+        HashSet<string> peerAddrs = new HashSet<string>();
+
+        volatile bool sending;
+        string mutedDeviceId;
+        int heartbeatTick, peerMisses;
+        volatile string peerState = "not contacted";
+
+        string MuteFlag { get { return Path.Combine(dir, "endpoint-muted.txt"); } }
+        string CfgPath { get { return Path.Combine(dir, "hotkey.txt"); } }
 
         public TrayContext()
         {
-            pcIcon = MakeIcon(Color.FromArgb(0, 120, 215), "PC");
-            ltIcon = MakeIcon(Color.FromArgb(230, 120, 0), "LT");
+            invoker.CreateControl();
+            localIcon = MakeIcon(Color.FromArgb(0, 120, 215), "LO");
+            sendIcon = MakeIcon(Color.FromArgb(230, 120, 0), "TX");
+            recvIcon = MakeIcon(Color.FromArgb(16, 137, 62), "RX");
 
+            RestoreEndpointAfterCrash();
             LoadHotkey();
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("Switch audio", null, delegate { Toggle(); });
+            menu.Items.Add("Send my audio to peer / play locally", null, delegate { ToggleSend(); });
+            menu.Items.Add("Pull peer's audio here", null, delegate { Pull(); });
             menu.Items.Add("Set hotkey...", null, delegate { StartCapture(); });
             menu.Items.Add("Exit", null, delegate { Quit(); });
             ni.ContextMenuStrip = menu;
-            ni.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Toggle(); };
+            ni.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ToggleSend(); };
+            ni.Icon = localIcon;
             ni.Visible = true;
 
             hk = new HotKeyWindow(hkMod, hkVk);
-            hk.Pressed += delegate { Toggle(); };
+            hk.Pressed += delegate(int id) { if (id == HotKeyWindow.Pull) Pull(); else ToggleSend(); };
 
             captureTimeout.Interval = 20000;
             captureTimeout.Tick += delegate { EndCapture(); ni.ShowBalloonTip(1500, "Hotkey", "Capture timed out", ToolTipIcon.None); };
 
-            StartReceiver();
-            ShowState();
+            LoadNetwork();
+            UpdateUi();
             if (Environment.GetCommandLineArgs().Length > 1 && Environment.GetCommandLineArgs()[1] == "--capture") StartCapture();
 
             timer.Interval = 1000;
-            timer.Tick += delegate { Apply(); UpdateTooltip(); WriteState(); };
+            timer.Tick += delegate { Tick(); };
             timer.Start();
         }
 
-        void StartReceiver()
+        // ---- configuration ----
+
+        void LoadNetwork()
         {
             string path = Path.Combine(dir, "local", "network.json");
             try
             {
                 var root = (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path));
-                var lt = (Dictionary<string, object>)root["laptop"];
-                string host = (string)lt["host"];
-                int port = lt.ContainsKey("port") ? Convert.ToInt32(lt["port"]) : 8080;
-                receiver = new Receiver(host, port);
+                var peer = (Dictionary<string, object>)root["peer"];
+                peerHost = (string)peer["host"];
+                int port = peer.ContainsKey("port") ? Convert.ToInt32(peer["port"]) : 8080;
+                if (peer.ContainsKey("controlPort")) peerControlPort = Convert.ToInt32(peer["controlPort"]);
+                if (root.ContainsKey("controlPort")) controlPort = Convert.ToInt32(root["controlPort"]);
+                ResolvePeer();
+
+                receiver = new Receiver(peerHost, port);
                 receiver.Start();
+                StartControlServer();
             }
             catch (Exception e)
             {
@@ -274,9 +314,210 @@ namespace AudioSwitch
             }
         }
 
+        void ResolvePeer()
+        {
+            var set = new HashSet<string>();
+            try { foreach (var a in Dns.GetHostAddresses(peerHost)) set.Add(a.ToString()); } catch { }
+            set.Add("127.0.0.1");
+            set.Add("::1");
+            peerAddrs = set;
+        }
+
+        // ---- control channel ----
+
+        void StartControlServer()
+        {
+            listener = new TcpListener(IPAddress.Any, controlPort);
+            listener.Start();
+            var t = new Thread(delegate()
+            {
+                while (true)
+                {
+                    TcpClient c;
+                    try { c = listener.AcceptTcpClient(); } catch { return; }
+                    try { Handle(c); } catch { }
+                    finally { c.Close(); }
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void Handle(TcpClient c)
+        {
+            var remote = ((IPEndPoint)c.Client.RemoteEndPoint).Address;
+            if (remote.IsIPv4MappedToIPv6) remote = remote.MapToIPv4();
+            if (!peerAddrs.Contains(remote.ToString()))
+            {
+                ResolvePeer();
+                if (!peerAddrs.Contains(remote.ToString())) return;
+            }
+            var s = c.GetStream();
+            s.ReadTimeout = 2000;
+            string line = new StreamReader(s, Encoding.ASCII).ReadLine();
+            string reply = "ERR";
+            if (line == "SENDING 1")
+            {
+                receiver.Feed = true;
+                // Only one side sends at a time: two senders would loop each other's audio back and forth.
+                if (sending) invoker.BeginInvoke((MethodInvoker)delegate { GoLocal(false, "Peer is sending to you, so your audio plays here again"); });
+                reply = "OK receiver=" + (receiver.Connected ? "connected" : "offline");
+            }
+            else if (line == "SENDING 0")
+            {
+                receiver.Feed = false;
+                reply = "OK";
+            }
+            else if (line == "TOGGLE")
+            {
+                invoker.BeginInvoke((MethodInvoker)delegate { ToggleSend(); });
+                reply = "OK";
+            }
+            var b = Encoding.ASCII.GetBytes(reply + "\n");
+            s.Write(b, 0, b.Length);
+        }
+
+        // ---- switching ----
+
+        void ToggleSend()
+        {
+            if (sending) { GoLocal(true, null); return; }
+            if (receiver == null) { ni.ShowBalloonTip(3000, "AudioSwitch", configError, ToolTipIcon.Warning); return; }
+
+            string reply = PeerLink.Ask(peerHost, peerControlPort, "SENDING 1");
+            if (reply == null || !reply.StartsWith("OK"))
+            {
+                peerState = "unreachable";
+                ni.ShowBalloonTip(3000, "AudioSwitch", "Peer AudioSwitch isn't answering. Your audio stays here.", ToolTipIcon.Warning);
+                return;
+            }
+            if (!reply.Contains("receiver=connected"))
+            {
+                PeerLink.Ask(peerHost, peerControlPort, "SENDING 0");
+                peerState = "reachable, not receiving";
+                ni.ShowBalloonTip(3000, "AudioSwitch", "Peer isn't connected to your sender. Your audio stays here.", ToolTipIcon.Warning);
+                return;
+            }
+            peerState = "ok";
+            peerMisses = 0;
+            receiver.Feed = false;
+            sending = true;
+            MuteEndpoint(true);
+            ni.ShowBalloonTip(1000, "Audio", "Sending your audio to the peer", ToolTipIcon.None);
+            UpdateUi();
+        }
+
+        void GoLocal(bool notifyPeer, string why)
+        {
+            bool was = sending;
+            sending = false;
+            MuteEndpoint(false);
+            if (notifyPeer && peerHost != null)
+                ThreadPool.QueueUserWorkItem(delegate { PeerLink.Ask(peerHost, peerControlPort, "SENDING 0"); });
+            if (was) ni.ShowBalloonTip(1500, "Audio", why ?? "Playing your audio here", ToolTipIcon.None);
+            UpdateUi();
+        }
+
+        void Pull()
+        {
+            if (peerHost == null) return;
+            if (sending) GoLocal(true, null);
+            string reply = PeerLink.Ask(peerHost, peerControlPort, "TOGGLE");
+            ni.ShowBalloonTip(2000, "Audio", reply == null ? "Peer AudioSwitch isn't answering" : "Asked the peer to toggle sending", ToolTipIcon.None);
+        }
+
+        // Sending mutes this machine's output endpoint. Loopback capture is taken before endpoint
+        // mute, so the peer still gets full-level audio. App-session mute would silence the capture too.
+        void MuteEndpoint(bool mute)
+        {
+            try
+            {
+                var en = new MMDeviceEnumerator();
+                if (mute)
+                {
+                    var dev = en.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+                    if (!dev.AudioEndpointVolume.Mute)
+                    {
+                        dev.AudioEndpointVolume.Mute = true;
+                        mutedDeviceId = dev.ID;
+                        File.WriteAllText(MuteFlag, dev.ID);
+                    }
+                }
+                else if (mutedDeviceId != null)
+                {
+                    en.GetDevice(mutedDeviceId).AudioEndpointVolume.Mute = false;
+                    mutedDeviceId = null;
+                    File.Delete(MuteFlag);
+                }
+            }
+            catch { }
+        }
+
+        void RestoreEndpointAfterCrash()
+        {
+            try
+            {
+                if (!File.Exists(MuteFlag)) return;
+                new MMDeviceEnumerator().GetDevice(File.ReadAllText(MuteFlag).Trim()).AudioEndpointVolume.Mute = false;
+                File.Delete(MuteFlag);
+            }
+            catch { }
+        }
+
+        void Tick()
+        {
+            // Every 5 s tell the peer our state, so a missed message or a restart can't leave it out of sync.
+            if (receiver != null && ++heartbeatTick >= 5)
+            {
+                heartbeatTick = 0;
+                bool s = sending;
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    string reply = PeerLink.Ask(peerHost, peerControlPort, s ? "SENDING 1" : "SENDING 0");
+                    bool lost = reply == null || (s && !reply.Contains("receiver=connected"));
+                    peerState = reply == null ? "unreachable" : (lost ? "not receiving" : "ok");
+                    if (s && lost && ++peerMisses >= 3)
+                        invoker.BeginInvoke((MethodInvoker)delegate { if (sending) GoLocal(false, "Lost the peer, so your audio plays here again"); });
+                    if (!lost) peerMisses = 0;
+                });
+            }
+            UpdateUi();
+        }
+
+        // ---- UI and state ----
+
         string ReceiverStatus { get { return receiver != null ? receiver.Status : configError; } }
 
-        string CfgPath { get { return Path.Combine(dir, "hotkey.txt"); } }
+        string Mode
+        {
+            get
+            {
+                if (sending) return "SENDING";
+                return receiver != null && receiver.Feed ? "RECEIVING" : "LOCAL";
+            }
+        }
+
+        void UpdateUi()
+        {
+            string mode = Mode;
+            ni.Icon = mode == "SENDING" ? sendIcon : mode == "RECEIVING" ? recvIcon : localIcon;
+            string t = mode + " | " + hkName + " | peer stream: " + ReceiverStatus;
+            ni.Text = t.Length > 63 ? t.Substring(0, 63) : t;
+            WriteState();
+        }
+
+        void WriteState()
+        {
+            try
+            {
+                File.WriteAllText(Path.Combine(dir, "state.txt"),
+                    "mode=" + Mode + " hotkey=" + hkName + (hk.Registered ? " ok" : " FAILED") + " pull=Shift+" + hkName +
+                    " receiver=[" + ReceiverStatus + "] bytes=" + (receiver != null ? Interlocked.Read(ref receiver.Bytes) : 0) +
+                    " peer-control=[" + peerState + "] endpoint-muted=" + (mutedDeviceId != null ? "yes" : "no") +
+                    " time=" + DateTime.Now.ToString("s"));
+            }
+            catch { }
+        }
 
         static string NameOf(uint mod, uint vk)
         {
@@ -328,7 +569,7 @@ namespace AudioSwitch
             };
             hookHandle = SetWindowsHookEx(13, hookProc, GetModuleHandle(null), 0);
             captureTimeout.Start();
-            ni.ShowBalloonTip(3000, "Set hotkey", "Press the key you want now (20 s)", ToolTipIcon.None);
+            ni.ShowBalloonTip(3000, "Set hotkey", "Press the key you want now (20 s). Shift plus it becomes pull.", ToolTipIcon.None);
         }
 
         void ApplyCapture(uint vk, uint mod)
@@ -344,15 +585,14 @@ namespace AudioSwitch
                 {
                     hkMod = mod; hkVk = vk; hkName = NameOf(mod, vk);
                     try { File.WriteAllText(CfgPath, mod + "," + vk); } catch { }
-                    ni.ShowBalloonTip(2000, "Hotkey set", hkName, ToolTipIcon.None);
+                    ni.ShowBalloonTip(2000, "Hotkey set", hkName + " (pull: " + NameOf(HotKeyWindow.PullMod(mod), vk) + ")", ToolTipIcon.None);
                 }
                 else
                 {
                     hk.Rebind(hkMod, hkVk);
                     ni.ShowBalloonTip(2500, "Hotkey failed", hkName + " unchanged. That key can't be registered.", ToolTipIcon.None);
                 }
-                UpdateTooltip();
-                WriteState();
+                UpdateUi();
             };
             t.Start();
         }
@@ -380,70 +620,18 @@ namespace AudioSwitch
             return Icon.FromHandle(bmp.GetHicon());
         }
 
-        // Laptop mode mutes every other app on the default device; PC mode unmutes only what we muted.
-        void Apply()
-        {
-            try
-            {
-                Sessions.ForEach(delegate(uint pid, SimpleAudioVolume vol)
-                {
-                    if (pid == myPid) return;
-                    bool cur = vol.Mute;
-                    if (laptop && !cur) { vol.Mute = true; ours.Add(pid); }
-                    else if (!laptop && cur && ours.Contains(pid)) { vol.Mute = false; ours.Remove(pid); }
-                });
-            }
-            catch { }
-        }
-
-        void UpdateTooltip()
-        {
-            string t = (laptop ? "LAPTOP" : "PC") + " | " + hkName + " | " + ReceiverStatus;
-            ni.Text = t.Length > 63 ? t.Substring(0, 63) : t;
-        }
-
-        void ShowState()
-        {
-            if (receiver != null) receiver.Feed = laptop;
-            ni.Icon = laptop ? ltIcon : pcIcon;
-            string body = laptop ? "LAPTOP (" + ReceiverStatus + ")" : "PC";
-            ni.ShowBalloonTip(1000, "Audio source", body, ToolTipIcon.None);
-            Apply();
-            UpdateTooltip();
-            WriteState();
-        }
-
-        void WriteState()
-        {
-            try
-            {
-                File.WriteAllText(Path.Combine(dir, "state.txt"),
-                    "mode=" + (laptop ? "LAPTOP" : "PC") + " hotkey=" + hkName + (hk.Registered ? " ok" : " FAILED") +
-                    " receiver=[" + ReceiverStatus + "] bytes=" + (receiver != null ? Interlocked.Read(ref receiver.Bytes) : 0) +
-                    " lastcapture=[" + lastCapture + "] time=" + DateTime.Now.ToString("s"));
-            }
-            catch { }
-        }
-
-        void Toggle()
-        {
-            laptop = !laptop;
-            ShowState();
-        }
-
         void Quit()
         {
             timer.Stop();
             EndCapture();
-            if (receiver != null) receiver.Stop();
-            try
+            if (sending)
             {
-                Sessions.ForEach(delegate(uint pid, SimpleAudioVolume vol)
-                {
-                    if (ours.Contains(pid)) vol.Mute = false;
-                });
+                sending = false;
+                MuteEndpoint(false);
+                if (peerHost != null) PeerLink.Ask(peerHost, peerControlPort, "SENDING 0");
             }
-            catch { }
+            if (receiver != null) receiver.Stop();
+            if (listener != null) { try { listener.Stop(); } catch { } }
             hk.Dispose();
             ni.Visible = false;
             ExitThread();

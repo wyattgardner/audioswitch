@@ -11,8 +11,12 @@ if (-not $Tag) { $Tag = $pin.tag }
 
 $go = (Get-Command go -ErrorAction SilentlyContinue).Source
 if (-not $go) {
-    $fallback = Join-Path $env:USERPROFILE 'Tools\go\bin\go.exe'
-    if (Test-Path $fallback) { $go = $fallback } else { throw 'Go 1.26 or later is required (go.dev/dl).' }
+    $go = @(
+        (Join-Path $env:USERPROFILE 'Tools\go\bin\go.exe'),
+        (Join-Path $env:USERPROFILE 'AppData\Local\Programs\go-toolchain\go\bin\go.exe'),
+        'C:\Program Files\Go\bin\go.exe'
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $go) { throw 'Go 1.26 or later is required (go.dev/dl).' }
 }
 
 $src = Join-Path ([IO.Path]::GetTempPath()) ("aoip-src-" + [guid]::NewGuid())
