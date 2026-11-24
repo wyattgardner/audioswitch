@@ -19,7 +19,8 @@ Both start on their own at sign-in.
 - While a machine is sending, its own speakers are muted at the endpoint and the other machine plays its stream mixed with its own audio. Loopback capture is taken before endpoint mute, so the stream stays at full level.
 - Only one machine sends at a time. If the other one starts sending, this one goes back to playing locally. Two senders would loop each other's audio back and forth.
 - Sending only starts if the other AudioSwitch answers and is connected to this machine's sender. Otherwise you get a balloon and the audio stays put. If the other machine disappears while you're sending, this machine goes back to local after about 15 seconds.
-- Tray icon: blue **LO** (playing locally), orange **TX** (sending), green **RX** (playing the other machine's audio). Left-click = F13. Right-click has the same actions plus **Set hotkey...** (Shift+your key becomes pull) and **Exit**.
+- Tray icon: blue **LO** (playing locally), orange **TX** (sending), green **RX** (playing the other machine's audio). Left-click = F13. Right-click has the same actions, **Preferences** and **Exit**.
+- **Preferences > Show notifications** turns Windows notifications for switches and errors on or off. It's off by default and saved per machine in `prefs.txt`. **Preferences > Set hotkey...** binds any key (Shift plus that key becomes pull). Its own prompts always show.
 - Exit, or a crash followed by restart, unmutes anything AudioSwitch muted.
 
 ## Install (on each machine)
@@ -47,6 +48,7 @@ Options: `-Port` (sender, default 8080), `-ControlPort` (default 8091), `-SkipFi
 ## Checking it works
 
 - **AudioSwitch state:** `%USERPROFILE%\Tools\AudioSwitch\state.txt`, refreshed every second. You want `receiver=[connected ...]` with `bytes=` growing, and `peer-control=[ok]` once the other machine is set up. `mode=` shows LOCAL, SENDING or RECEIVING.
+- **AudioSwitch event log:** `%USERPROFILE%\Tools\AudioSwitch\events.log`. It records every hotkey press, control message in and out, feed and mode change, and suppressed notification, with millisecond timestamps. Compare both machines' logs to see who asked what.
 - **Sender log:** `%APPDATA%\ElTheLedge\AudioOverIP\logs\headless-server.log`. It logs the playback device it captures, each client that connects, and "no active playback device" if there's nothing to capture.
 - **From the other machine:** `Test-NetConnection <ip> -Port 8080` and `-Port 8091` should both succeed.
 

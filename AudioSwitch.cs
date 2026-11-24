@@ -249,6 +249,57 @@ namespace AudioSwitch
         string mutedDeviceId;
         int heartbeatTick, peerMisses;
         volatile string peerState = "not contacted";
+        long lastPeerMsgTicks;
+        readonly object logLock = new object();
+
+        string EventLog { get { return Path.Combine(dir, "events.log"); } }
+        string PrefsPath { get { return Path.Combine(dir, "prefs.txt"); } }
+
+        // Off by default; toggled under Preferences in the tray menu and saved per machine.
+        bool notifications;
+
+        void LoadPrefs()
+        {
+            try
+            {
+                if (!File.Exists(PrefsPath)) return;
+                foreach (var line in File.ReadAllLines(PrefsPath))
+                    if (line.Trim() == "notifications=1") notifications = true;
+            }
+            catch { }
+        }
+
+        void SavePrefs()
+        {
+            try { File.WriteAllText(PrefsPath, "notifications=" + (notifications ? "1" : "0") + Environment.NewLine); } catch { }
+        }
+
+        void Notify(int ms, string title, string text, ToolTipIcon icon)
+        {
+            Log("notice: " + text);
+            if (notifications) ni.ShowBalloonTip(ms, title, text, icon);
+        }
+
+        void Log(string what)
+        {
+            lock (logLock)
+            {
+                try
+                {
+                    var f = new FileInfo(EventLog);
+                    if (f.Exists && f.Length > 1024 * 1024) File.Delete(EventLog);
+                    File.AppendAllText(EventLog, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + what + Environment.NewLine);
+                }
+                catch { }
+            }
+        }
+
+        void SetFeed(bool on, string why)
+        {
+            if (receiver == null || receiver.Feed == on) return;
+            receiver.Feed = on;
+            Log("feed " + (on ? "ON" : "OFF") + " (" + why + ")");
+        }
 
         string MuteFlag { get { return Path.Combine(dir, "endpoint-muted.txt"); } }
         string CfgPath { get { return Path.Combine(dir, "hotkey.txt"); } }
@@ -262,11 +313,17 @@ namespace AudioSwitch
 
             RestoreEndpointAfterCrash();
             LoadHotkey();
+            LoadPrefs();
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Send my audio to peer / play locally", null, delegate { ToggleSend(); });
             menu.Items.Add("Pull peer's audio here", null, delegate { Pull(); });
-            menu.Items.Add("Set hotkey...", null, delegate { StartCapture(); });
+            var prefs = new ToolStripMenuItem("Preferences");
+            var notifyItem = new ToolStripMenuItem("Show notifications") { CheckOnClick = true, Checked = notifications };
+            notifyItem.CheckedChanged += delegate { notifications = notifyItem.Checked; SavePrefs(); };
+            prefs.DropDownItems.Add(notifyItem);
+            prefs.DropDownItems.Add("Set hotkey...", null, delegate { StartCapture(); });
+            menu.Items.Add(prefs);
             menu.Items.Add("Exit", null, delegate { Quit(); });
             ni.ContextMenuStrip = menu;
             ni.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ToggleSend(); };
@@ -274,7 +331,11 @@ namespace AudioSwitch
             ni.Visible = true;
 
             hk = new HotKeyWindow(hkMod, hkVk);
-            hk.Pressed += delegate(int id) { if (id == HotKeyWindow.Pull) Pull(); else ToggleSend(); };
+            hk.Pressed += delegate(int id)
+            {
+                Log("hotkey " + (id == HotKeyWindow.Pull ? "PULL" : "PUSH") + " pressed");
+                if (id == HotKeyWindow.Pull) Pull(); else ToggleSend();
+            };
 
             captureTimeout.Interval = 20000;
             captureTimeout.Tick += delegate { EndCapture(); ni.ShowBalloonTip(1500, "Hotkey", "Capture timed out", ToolTipIcon.None); };
@@ -304,13 +365,15 @@ namespace AudioSwitch
                 ResolvePeer();
 
                 receiver = new Receiver(peerHost, port);
+                receiver.Feed = false;
                 receiver.Start();
                 StartControlServer();
+                Log("started: peer " + peerHost + ":" + port + " control " + peerControlPort + ", listening on " + controlPort + ", feed OFF, mode LOCAL");
             }
             catch (Exception e)
             {
                 configError = "config error: " + e.Message;
-                ni.ShowBalloonTip(4000, "AudioSwitch", "Can't read " + path, ToolTipIcon.Warning);
+                Notify(4000, "AudioSwitch", "Can't read " + path, ToolTipIcon.Warning);
             }
         }
 
@@ -350,29 +413,37 @@ namespace AudioSwitch
             if (!peerAddrs.Contains(remote.ToString()))
             {
                 ResolvePeer();
-                if (!peerAddrs.Contains(remote.ToString())) return;
+                if (!peerAddrs.Contains(remote.ToString())) { Log("control: rejected connection from " + remote); return; }
             }
             var s = c.GetStream();
             s.ReadTimeout = 2000;
             string line = new StreamReader(s, Encoding.ASCII).ReadLine();
+            Interlocked.Exchange(ref lastPeerMsgTicks, DateTime.UtcNow.Ticks);
             string reply = "ERR";
             if (line == "SENDING 1")
             {
-                receiver.Feed = true;
-                // Only one side sends at a time: two senders would loop each other's audio back and forth.
-                if (sending) invoker.BeginInvoke((MethodInvoker)delegate { GoLocal(false, "Peer is sending to you, so your audio plays here again"); });
-                reply = "OK receiver=" + (receiver.Connected ? "connected" : "offline");
+                // Only feed when our receiver can actually play the peer's stream.
+                if (receiver.Connected)
+                {
+                    SetFeed(true, "peer says SENDING 1 from " + remote);
+                    // Only one side sends at a time: two senders would loop each other's audio back and forth.
+                    if (sending) invoker.BeginInvoke((MethodInvoker)delegate { GoLocal(false, "Peer is sending to you, so your audio plays here again"); });
+                    reply = "OK receiver=connected";
+                }
+                else reply = "OK receiver=offline";
             }
             else if (line == "SENDING 0")
             {
-                receiver.Feed = false;
+                SetFeed(false, "peer says SENDING 0");
                 reply = "OK";
             }
             else if (line == "TOGGLE")
             {
+                Log("control: peer asked us to toggle sending (pull)");
                 invoker.BeginInvoke((MethodInvoker)delegate { ToggleSend(); });
                 reply = "OK";
             }
+            if (line != "SENDING 0" || reply != "OK") Log("control in: '" + line + "' from " + remote + " -> " + reply);
             var b = Encoding.ASCII.GetBytes(reply + "\n");
             s.Write(b, 0, b.Length);
         }
@@ -382,28 +453,32 @@ namespace AudioSwitch
         void ToggleSend()
         {
             if (sending) { GoLocal(true, null); return; }
-            if (receiver == null) { ni.ShowBalloonTip(3000, "AudioSwitch", configError, ToolTipIcon.Warning); return; }
+            if (receiver == null) { Notify(3000, "AudioSwitch", configError, ToolTipIcon.Warning); return; }
 
             string reply = PeerLink.Ask(peerHost, peerControlPort, "SENDING 1");
+            Log("control out: 'SENDING 1' -> " + (reply ?? "no answer"));
             if (reply == null || !reply.StartsWith("OK"))
             {
                 peerState = "unreachable";
-                ni.ShowBalloonTip(3000, "AudioSwitch", "Peer AudioSwitch isn't answering. Your audio stays here.", ToolTipIcon.Warning);
+                // The peer may have acted on it even if the answer got lost, so take it back.
+                ThreadPool.QueueUserWorkItem(delegate { PeerLink.Ask(peerHost, peerControlPort, "SENDING 0"); });
+                Notify(3000, "AudioSwitch", "Peer AudioSwitch isn't answering. Your audio stays here.", ToolTipIcon.Warning);
                 return;
             }
             if (!reply.Contains("receiver=connected"))
             {
                 PeerLink.Ask(peerHost, peerControlPort, "SENDING 0");
                 peerState = "reachable, not receiving";
-                ni.ShowBalloonTip(3000, "AudioSwitch", "Peer isn't connected to your sender. Your audio stays here.", ToolTipIcon.Warning);
+                Notify(3000, "AudioSwitch", "Peer isn't connected to your sender. Your audio stays here.", ToolTipIcon.Warning);
                 return;
             }
             peerState = "ok";
             peerMisses = 0;
-            receiver.Feed = false;
+            SetFeed(false, "we started sending");
             sending = true;
+            Log("mode SENDING (endpoint muted)");
             MuteEndpoint(true);
-            ni.ShowBalloonTip(1000, "Audio", "Sending your audio to the peer", ToolTipIcon.None);
+            Notify(1000, "Audio", "Sending your audio to the peer", ToolTipIcon.None);
             UpdateUi();
         }
 
@@ -411,10 +486,11 @@ namespace AudioSwitch
         {
             bool was = sending;
             sending = false;
+            if (was) Log("mode LOCAL (" + (why ?? "toggled back") + ")");
             MuteEndpoint(false);
             if (notifyPeer && peerHost != null)
                 ThreadPool.QueueUserWorkItem(delegate { PeerLink.Ask(peerHost, peerControlPort, "SENDING 0"); });
-            if (was) ni.ShowBalloonTip(1500, "Audio", why ?? "Playing your audio here", ToolTipIcon.None);
+            if (was) Notify(1500, "Audio", why ?? "Playing your audio here", ToolTipIcon.None);
             UpdateUi();
         }
 
@@ -423,7 +499,8 @@ namespace AudioSwitch
             if (peerHost == null) return;
             if (sending) GoLocal(true, null);
             string reply = PeerLink.Ask(peerHost, peerControlPort, "TOGGLE");
-            ni.ShowBalloonTip(2000, "Audio", reply == null ? "Peer AudioSwitch isn't answering" : "Asked the peer to toggle sending", ToolTipIcon.None);
+            Log("control out: 'TOGGLE' -> " + (reply ?? "no answer"));
+            Notify(2000, "Audio", reply == null ? "Peer AudioSwitch isn't answering" : "Asked the peer to toggle sending", ToolTipIcon.None);
         }
 
         // Sending mutes this machine's output endpoint. Loopback capture is taken before endpoint
@@ -481,6 +558,10 @@ namespace AudioSwitch
                     if (!lost) peerMisses = 0;
                 });
             }
+            // The peer heartbeats every 5 s. If it goes quiet while we play its stream, stop playing it.
+            if (receiver != null && receiver.Feed &&
+                DateTime.UtcNow.Ticks - Interlocked.Read(ref lastPeerMsgTicks) > TimeSpan.FromSeconds(15).Ticks)
+                SetFeed(false, "no word from peer for 15 s");
             UpdateUi();
         }
 
@@ -511,7 +592,8 @@ namespace AudioSwitch
             try
             {
                 File.WriteAllText(Path.Combine(dir, "state.txt"),
-                    "mode=" + Mode + " hotkey=" + hkName + (hk.Registered ? " ok" : " FAILED") + " pull=Shift+" + hkName +
+                    "mode=" + Mode + " feed=" + (receiver != null && receiver.Feed ? "1" : "0") +
+                    " hotkey=" + hkName + (hk.Registered ? " ok" : " FAILED") + " pull=" + NameOf(HotKeyWindow.PullMod(hkMod), hkVk) +
                     " receiver=[" + ReceiverStatus + "] bytes=" + (receiver != null ? Interlocked.Read(ref receiver.Bytes) : 0) +
                     " peer-control=[" + peerState + "] endpoint-muted=" + (mutedDeviceId != null ? "yes" : "no") +
                     " time=" + DateTime.Now.ToString("s"));
