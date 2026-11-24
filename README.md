@@ -33,25 +33,51 @@ With one keyboard on a KVM, the key goes to whichever machine the KVM has select
 
 ## Install (on each machine)
 
+1. Download `AudioSwitch-Setup-x.y.z.exe` from the [latest release](https://github.com/wyattgardner/audioswitch/releases/latest). If you like, check it against `SHA256SUMS.txt` from the same release:
+
+   ```powershell
+   (Get-FileHash .\AudioSwitch-Setup-1.0.0.exe -Algorithm SHA256).Hash
+   ```
+
+2. Run it on **both** machines. It installs per-user, with no admin rights needed. It asks for:
+   - **The other machine's IP address or name.** Give both machines DHCP reservations so the address doesn't change.
+   - **This machine's hotkey.** Default F13. Shift plus the key becomes pull. Use something like `Ctrl+Alt+F9` if the keyboard has no F13.
+   - **Windows Firewall:** whether to allow the other machine in on TCP 8080 and 8091. The rules are scoped to the other machine's address. This step asks for admin once. Untick it if the firewall is managed elsewhere.
+
+That's it. Both programs start right away and at every sign-in, and the tray icon shows blue **LO**. The exe isn't signed yet, so Windows SmartScreen may warn on first run ("More info", then "Run anyway").
+
+What the installer does:
+
+- Installs to `%USERPROFILE%\Tools\AudioSwitch`: `AudioSwitch.exe`, `NAudio.dll`, `sender\AudioOverIP-headless.exe`, `configure.ps1`, and license files. It's not under `%LOCALAPPDATA%`, because when Claude desktop runs an installer `%LOCALAPPDATA%` is redirected into its own package folder, out of Task Scheduler's sight.
+- Writes `local\network.json` (the other machine's address) and `hotkey.txt` there.
+- Registers two per-user logon tasks, "AudioSwitch" and "Audio Over IP sender (headless)". A once-a-minute repeat with "ignore new instance" restarts either one within a minute if it dies.
+- Logs to `install.log` in the install folder.
+
+**Upgrade:** run the newer installer. It asks AudioSwitch to quit cleanly, which restores any mutes, replaces the files, keeps your peer and hotkey, and restarts everything.
+
+**Uninstall:** Settings > Apps > AudioSwitch. It quits AudioSwitch cleanly, removes both logon tasks and the firewall rules (asks for admin), and deletes the install folder.
+
+**Silent install**, for scripts or other admins:
+
+```powershell
+.\AudioSwitch-Setup-1.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /PeerHost=192.0.2.20 /Hotkey=F13 [/NoFirewall]
+```
+
+On an upgrade, `/PeerHost` and `/Hotkey` can be left out, and the previous answers are reused.
+
+### From source
+
 Needs git, Go 1.26 or later, and Windows' built-in .NET Framework 4.x.
 
 ```powershell
 git clone https://github.com/wyattgardner/audioswitch.git
 cd audioswitch
-./setup.ps1 -PeerHost <the other machine's IP>
+./setup.ps1 -PeerHost <the other machine's IP> [-Hotkey F13] [-SkipFirewall]
 ```
 
-Setup does the following:
+This builds both programs (NAudio 1.10.0 from NuGet, hash-pinned; Audio Over IP v0.9.0.1, commit-pinned, plus `sender/headless.patch`) and installs them in the same layout as the installer. Later runs can drop `-PeerHost`.
 
-1. Writes `local/network.json` with the other machine's address. `local/` is git-ignored, so real addresses never get committed. Later runs reuse it, so plain `./setup.ps1` is enough.
-2. Builds the headless sender from the pinned upstream release plus `sender/headless.patch`, and installs it to `%USERPROFILE%\Tools\AudioOverIP`.
-3. Builds AudioSwitch (NAudio 1.10.0 from NuGet, hash pinned) and installs it to `%USERPROFILE%\Tools\AudioSwitch`.
-4. Adds inbound firewall rules for TCP 8080 (sender) and 8091 (AudioSwitch control), from the other machine's address only. This step asks for admin. If it's declined, setup prints the command to run.
-5. Registers two per-user logon tasks, "Audio Over IP sender (headless)" and "AudioSwitch". A once-a-minute repeat with "ignore new instance" restarts either one within a minute if it dies.
-
-Everything installs under `%USERPROFILE%\Tools`, not `%LOCALAPPDATA%`, because when Claude desktop runs a script `%LOCALAPPDATA%` is redirected into its own package folder, out of Task Scheduler's sight.
-
-Options: `-Hotkey` (this machine's push key, e.g. `F13` or `Ctrl+Alt+F9`; Shift plus it becomes pull; default F13), `-Port` (sender, default 8080), `-ControlPort` (default 8091), `-SkipFirewall`. Use `-Hotkey` on a machine whose keyboard has no F13. Left-clicking the tray icon always works as a fallback.
+To build the installer itself, you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php): `./build-release.ps1` writes `dist\AudioSwitch-Setup-<version>.exe` and `dist\SHA256SUMS.txt`. Pushing a `v*` tag that matches `VERSION` makes the Release workflow build it on GitHub and publish the release.
 
 ## Checking it works
 
@@ -84,17 +110,21 @@ What to tell IT about each file:
   - Captures the default playback device with WASAPI loopback and serves it on TCP 8080 to clients on the LAN. No window and no admin rights.
   - Logs to `%APPDATA%\ElTheLedge\AudioOverIP\logs`.
 
-Neither one contacts the internet. The only downloads are at build time: NuGet (NAudio, hash-pinned), GitHub (Audio Over IP source, commit-pinned) and the Go module proxy. Both exes are built locally from source by `setup.ps1`, so their hashes change with each build. An allow-list by path or by publisher (once signed) holds up better than one by hash.
+Neither one contacts the internet. The release exes are built by the public GitHub Actions Release workflow from the tagged source, so each release has fixed file hashes IT can allow-list. The installer's hash is in the release's `SHA256SUMS.txt`. A build from source makes different hashes, so allow-list by path in that case: `%USERPROFILE%\Tools\AudioSwitch\AudioSwitch.exe` and `...\sender\AudioOverIP-headless.exe`.
 
 ## Layout
 
 | Path | What | License |
 | --- | --- | --- |
-| `AudioSwitch.cs`, `build.ps1`, `setup.ps1` | Tray app, build and setup scripts | MIT |
+| `AudioSwitch.cs`, `build.ps1` | Tray app and its build | MIT |
+| `install/configure.ps1` | Writes config and hotkey, firewall rules, logon tasks, clean stop and uninstall. Shared by the installer and `setup.ps1`. | MIT |
+| `installer/AudioSwitch.iss`, `build-release.ps1` | Inno Setup installer and the release build | MIT |
+| `setup.ps1` | Build from source and install | MIT |
 | `sender/` | Patch adding a headless sender to Audio Over IP, plus build and upstream-check scripts. See [sender/README.md](sender/README.md). | EUPL-1.2 |
-| `network.example.json` | Shape of `local/network.json` | MIT |
+| `VERSION`, `CHANGELOG.md` | Release version (stamped into the exe and installer) and release notes | |
+| `network.example.json` | Shape of `local\network.json` | MIT |
 
-Audio Over IP is by ElTheLedge and licensed EUPL-1.2. This repo stores only the patch, never upstream source or binaries.
+Third-party components and their licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Audio Over IP is by ElTheLedge, licensed EUPL-1.2, and NAudio 1.10.0 is Ms-PL. The repo stores only the Audio Over IP patch, never upstream source. Release installers include the built sender with its license and the license of every Go module it links.
 
 ## Upstream updates
 
@@ -105,5 +135,6 @@ Audio Over IP is by ElTheLedge and licensed EUPL-1.2. This repo stores only the 
 - Windows only. Tested on Windows 11.
 - The stream and the control channel aren't encrypted or authenticated beyond "comes from the configured peer address". Keep it on a trusted LAN.
 - Received audio plays on the receiving machine's default output device as it was when the connection started.
-- Quitting from the tray lasts until the watchdog restarts it, within a minute. To stop it for good, disable the scheduled tasks.
+- Quitting from the tray lasts until the watchdog restarts it, within a minute. To stop it for good, disable the scheduled tasks or uninstall.
+- The tray menu's first line shows the installed version, and `state.txt` starts with `version=`.
 - The exes are unsigned, so SmartScreen or antivirus may complain.

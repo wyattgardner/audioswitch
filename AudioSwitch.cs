@@ -23,13 +23,29 @@ namespace AudioSwitch
         [STAThread]
         static void Main()
         {
+            bool quit = Environment.GetCommandLineArgs().Skip(1).Contains("--quit");
             bool created;
             using (var m = new Mutex(true, "AudioSwitchTray", out created))
             {
-                if (!created) return;
+                // --quit asks the running instance to exit cleanly (restoring any mutes); used by the installer.
+                if (!created) { if (quit) AskRunningToQuit(); return; }
+                if (quit) return;
                 Application.EnableVisualStyles();
                 Application.Run(new TrayContext());
             }
+        }
+
+        static void AskRunningToQuit()
+        {
+            int port = 8091;
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "local", "network.json");
+                var root = (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path));
+                if (root.ContainsKey("controlPort")) port = Convert.ToInt32(root["controlPort"]);
+            }
+            catch { }
+            PeerLink.Ask("127.0.0.1", port, "QUIT");
         }
     }
 
@@ -413,6 +429,8 @@ namespace AudioSwitch
             LoadPrefs();
 
             var menu = new ContextMenuStrip();
+            menu.Items.Add(new ToolStripMenuItem("AudioSwitch " + AppInfo.Version) { Enabled = false });
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Send my audio to peer / play locally", null, delegate { ToggleSend(); });
             menu.Items.Add("Pull peer's audio here", null, delegate { Pull(); });
             var prefs = new ToolStripMenuItem("Preferences");
@@ -465,7 +483,7 @@ namespace AudioSwitch
                 receiver.Feed = false;
                 receiver.Start();
                 StartControlServer();
-                Log("started: peer " + peerHost + ":" + port + " control " + peerControlPort + ", listening on " + controlPort + ", feed OFF, mode LOCAL");
+                Log("started " + AppInfo.Version + ": peer " + peerHost + ":" + port + " control " + peerControlPort + ", listening on " + controlPort + ", feed OFF, mode LOCAL");
             }
             catch (Exception e)
             {
@@ -534,6 +552,12 @@ namespace AudioSwitch
             {
                 SetFeed(false, "peer says SENDING 0");
                 if (rxMuted.Count > 0) invoker.BeginInvoke((MethodInvoker)delegate { ApplyRx(); UpdateUi(); });
+                reply = "OK";
+            }
+            else if (line == "QUIT" && IPAddress.IsLoopback(remote))
+            {
+                Log("control: QUIT from this machine");
+                invoker.BeginInvoke((MethodInvoker)delegate { Quit(); });
                 reply = "OK";
             }
             else if (line == "TOGGLE")
@@ -693,7 +717,7 @@ namespace AudioSwitch
             try
             {
                 File.WriteAllText(Path.Combine(dir, "state.txt"),
-                    "mode=" + Mode + " feed=" + (receiver != null && receiver.Feed ? "1" : "0") +
+                    "version=" + AppInfo.Version + " mode=" + Mode + " feed=" + (receiver != null && receiver.Feed ? "1" : "0") +
                     " hotkey=" + hkName + (hk.Registered ? " ok" : " FAILED") + " pull=" + NameOf(HotKeyWindow.PullMod(hkMod), hkVk) +
                     " receiver=[" + ReceiverStatus + "] bytes=" + (receiver != null ? Interlocked.Read(ref receiver.Bytes) : 0) +
                     " peer-control=[" + peerState + "] endpoint-muted=" + (mutedDeviceId != null ? "yes" : "no") +

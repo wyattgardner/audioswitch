@@ -2,7 +2,9 @@
 param(
     [string]$OutDir = (Join-Path $PSScriptRoot 'bin'),
     [string]$Tag,
-    [switch]$SkipCommitCheck
+    [switch]$SkipCommitCheck,
+    # Where to put the license files of every Go module linked into the exe (for binary releases).
+    [string]$LicensesDir
 )
 # Native tools are judged by exit code; Windows PowerShell would turn their stderr into errors under 'Stop'.
 $ErrorActionPreference = 'Continue'
@@ -38,6 +40,21 @@ try {
     finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { throw "go build failed for $Tag" }
     Copy-Item (Join-Path $src 'LICENSE') (Join-Path $OutDir 'LICENSE-EUPL-1.2.txt') -Force
+
+    if ($LicensesDir) {
+        New-Item -ItemType Directory -Force $LicensesDir | Out-Null
+        Copy-Item (Join-Path (& $go env GOROOT) 'LICENSE') (Join-Path $LicensesDir 'go-runtime.txt') -Force
+        Push-Location $src
+        try { $mods = & $go list -tags headless -deps -f '{{with .Module}}{{if not .Main}}{{.Path}}|{{.Dir}}{{end}}{{end}}' . | Sort-Object -Unique }
+        finally { Pop-Location }
+        foreach ($m in $mods | Where-Object { $_ }) {
+            $path, $dir = $m.Split('|')
+            $lic = Get-ChildItem $dir -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING)' } | Select-Object -First 1
+            if (-not $lic) { throw "No license file found for Go module $path" }
+            Copy-Item $lic.FullName (Join-Path $LicensesDir (($path -replace '[/\\]', '_') + '.txt')) -Force
+        }
+        "Collected licenses for $(@($mods | Where-Object { $_ }).Count) Go modules plus the Go runtime"
+    }
     "Built $OutDir\AudioOverIP-headless.exe from $Tag ($head)"
 }
 finally { Remove-Item $src -Recurse -Force -ErrorAction SilentlyContinue }

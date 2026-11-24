@@ -9,3 +9,6 @@ endpoint-muted.txt
 events.log
 prefs.txt
 rx-muted.txt
+obj/
+dist/
+install.log
