@@ -11,10 +11,16 @@ Both start on their own at sign-in.
 
 ## Switching
 
-| Key | On the machine where you press it |
+Press **F13 on the machine whose audio you want to move.** Its audio then plays on the other machine's speakers. Press F13 on it again to bring the audio back.
+
+**Shift+F13** pulls the other machine's audio to the one you're on, so you don't have to switch keyboards or a KVM to reach it. Press it again to send that audio back.
+
+With one keyboard on a KVM, the key goes to whichever machine the KVM has selected. So F13 moves that machine's audio, and Shift+F13 brings the other one's here.
+
+| Key | Effect, on the machine that receives the keypress |
 | --- | --- |
-| **F13** | Toggle: send my audio to the other machine, or play it here again |
-| **Shift+F13** | Pull: ask the other machine to toggle sending its audio here |
+| **F13** | Send this machine's audio to the other machine, or play it here again |
+| **Shift+F13** | Ask the other machine to send its audio here, or to take it back |
 
 - Each machine's speakers play exactly one source:
   - **Sending:** the machine's own speakers are muted at the endpoint. Loopback capture is taken before endpoint mute, so the stream stays at full level.
@@ -60,6 +66,25 @@ Options: `-Hotkey` (this machine's push key, e.g. `F13` or `Ctrl+Alt+F9`; Shift 
 | `receiver=[sender error 500 ...]` | The other machine has no active playback device |
 | `peer-control=[unreachable]` | The other AudioSwitch isn't running, or its firewall blocks 8091 |
 | Connected but silent | The sending machine plays to a device other than its default, or nothing is playing |
+
+## Managed machines and EDR
+
+On a company-managed machine, endpoint security such as SentinelOne may quarantine or delete `AudioSwitch.exe` or the headless sender. They're unsigned, they register a global hotkey, they change audio mute state, and they listen on the network. The fix is an allow-list entry from IT. Don't rename, repack or relocate the files to get past it.
+
+What to tell IT about each file:
+
+- **AudioSwitch.exe** (built from `AudioSwitch.cs` in this repo, C#/.NET Framework 4, NAudio 1.10.0)
+  - Per-user tray app started by a logon task, with no admin rights and no service.
+  - Registers one global hotkey (default F13, plus Shift+F13) through `RegisterHotKey`. A low-level keyboard hook runs only while the user picks a new hotkey in the menu, for up to 20 s.
+  - Connects to the other machine's sender on TCP 8080 (HTTP plus websocket) and plays that audio with NAudio/WASAPI.
+  - Listens on TCP 8091 for one-line commands (`SENDING 1|0`, `TOGGLE`) and rejects any connection that isn't from the configured peer address. It also connects to the peer's 8091.
+  - While sending: mutes this machine's default output endpoint. While receiving: mutes other apps' audio sessions on the default output, and restores them afterwards.
+  - Writes only beside itself in `%USERPROFILE%\Tools\AudioSwitch`: state, event log, preferences and hotkey files.
+- **AudioOverIP-headless.exe** (built from upstream Audio Over IP v0.9.0.1 plus `sender/headless.patch`, Go)
+  - Captures the default playback device with WASAPI loopback and serves it on TCP 8080 to clients on the LAN. No window and no admin rights.
+  - Logs to `%APPDATA%\ElTheLedge\AudioOverIP\logs`.
+
+Neither one contacts the internet. The only downloads are at build time: NuGet (NAudio, hash-pinned), GitHub (Audio Over IP source, commit-pinned) and the Go module proxy. Both exes are built locally from source by `setup.ps1`, so their hashes change with each build. An allow-list by path or by publisher (once signed) holds up better than one by hash.
 
 ## Layout
 
