@@ -179,7 +179,12 @@ namespace AudioSwitch
                 {
                     Exception inner = e;
                     while (inner.InnerException != null) inner = inner.InnerException;
-                    Status = "offline: " + inner.Message;
+                    var http = inner as WebException;
+                    var resp = http != null ? http.Response as HttpWebResponse : null;
+                    if (resp != null && (int)resp.StatusCode == 500)
+                        Status = "sender error 500: laptop has no active playback device?";
+                    else
+                        Status = "offline: " + inner.Message;
                 }
                 finally
                 {

@@ -10,10 +10,10 @@ index 8f33f81..432c178 100644
  import (
 diff --git a/main_headless.go b/main_headless.go
 new file mode 100644
-index 0000000..e1bf645
+index 0000000..739a7bb
 --- /dev/null
 +++ b/main_headless.go
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,111 @@
 +//go:build headless
 +
 +// Headless sender: the same capture and server code as the GUI's Sender
@@ -31,6 +31,9 @@ index 0000000..e1bf645
 +	"os/signal"
 +	"path/filepath"
 +	"runtime"
++	"time"
++
++	"AuOvIP/wcatools"
 +
 +	"github.com/go-ole/go-ole"
 +)
@@ -54,6 +57,28 @@ index 0000000..e1bf645
 +	return <-ready
 +}
 +
++// watchPlaybackDevice logs whenever the default playback device appears, changes or goes away.
++// With no active playback device Windows renders nothing, loopback has nothing to capture and
++// /getAudioConfig answers 500, so say so plainly in the log.
++func watchPlaybackDevice() {
++	last := "unset"
++	for {
++		name := ""
++		if cfg, err := wcatools.GetDefaultDeviceInfo(); err == nil {
++			name = cfg.Name
++		}
++		if name != last {
++			if name == "" {
++				serverLogger.Errorf("no active playback device: Windows has nothing to play to, so there is no audio to capture. Plug in or enable an output device.")
++			} else {
++				serverLogger.Infof("default playback device: %s", name)
++			}
++			last = name
++		}
++		time.Sleep(10 * time.Second)
++	}
++}
++
 +func main() {
 +	_ = LoadConfig()
 +	port := flag.String("port", serverConfig.Port, "TCP port to listen on")
@@ -72,6 +97,7 @@ index 0000000..e1bf645
 +		serverLogger.Errorf("CoInitializeEx(MTA) failed: %v", err)
 +		os.Exit(1)
 +	}
++	go watchPlaybackDevice()
 +
 +	// Nobody reads the GUI's stats channel here; drain it so the stats
 +	// goroutine never blocks.

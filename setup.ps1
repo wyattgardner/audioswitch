@@ -54,6 +54,14 @@ if ($Role -eq 'PC') {
     Register-LogonTask 'AudioSwitch' (Join-Path $dest 'AudioSwitch.exe') $null
 }
 else {
+    # Loopback capture needs an active playback device: with none, Windows renders nothing and the sender answers 500.
+    $render = @(Get-PnpDevice -Class AudioEndpoint -Status OK -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -like 'SWD\MMDEVAPI\{0.0.0.00000000}*' })
+    if ($render.Count -eq 0) {
+        Write-Warning 'No active playback device on this machine. The sender has nothing to capture until one is connected or enabled (built-in speaker, or a plug in the dock''s audio jack).'
+    }
+    else { "Active playback devices: " + (($render | ForEach-Object FriendlyName) -join ', ') }
+
     $dest = Join-Path $tools 'AudioOverIP'
     Get-Process AudioOverIP-headless -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Milliseconds 500
