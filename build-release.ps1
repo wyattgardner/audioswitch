@@ -1,5 +1,5 @@
 # Builds the release: AudioSwitch, the headless sender, all license files, and the Inno Setup installer.
-# Output: dist\AudioSwitch-Setup-<version>.exe and dist\SHA256SUMS.txt. Needs git, Go 1.26+ and Inno Setup 6.
+# Output: dist\AudioSwitch-Setup-<version>.exe. Needs git, Go 1.26+ and Inno Setup 6.
 param([string]$OutDir = (Join-Path $PSScriptRoot 'dist'))
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -31,7 +31,5 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed ($LASTEXITCODE)" }
 
 $setup = Join-Path $OutDir "AudioSwitch-Setup-$version.exe"
-$hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
-"$hash  AudioSwitch-Setup-$version.exe" | Set-Content (Join-Path $OutDir 'SHA256SUMS.txt') -Encoding ASCII
 "Built $setup"
-"SHA-256 $hash"
+"SHA-256 " + (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()

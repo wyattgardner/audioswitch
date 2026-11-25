@@ -33,7 +33,7 @@ With one keyboard on a KVM, the key goes to whichever machine the KVM has select
 
 ## Install (on each machine)
 
-1. Download `AudioSwitch-Setup-x.y.z.exe` from the [latest release](https://github.com/wyattgardner/audioswitch/releases/latest). If you like, check it against `SHA256SUMS.txt` from the same release:
+1. Download `AudioSwitch-Setup-x.y.z.exe` from the [latest release](https://github.com/wyattgardner/audioswitch/releases/latest). If you like, compare its hash with the SHA-256 that GitHub shows next to the download:
 
    ```powershell
    (Get-FileHash .\AudioSwitch-Setup-1.0.0.exe -Algorithm SHA256).Hash
@@ -77,7 +77,7 @@ cd audioswitch
 
 This builds both programs (NAudio 1.10.0 from NuGet, hash-pinned; Audio Over IP v0.9.0.1, commit-pinned, plus `sender/headless.patch`) and installs them in the same layout as the installer. Later runs can drop `-PeerHost`.
 
-To build the installer itself, you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php): `./build-release.ps1` writes `dist\AudioSwitch-Setup-<version>.exe` and `dist\SHA256SUMS.txt`. Pushing a `v*` tag that matches `VERSION` makes the Release workflow build it on GitHub and publish the release.
+To build the installer itself, you also need [Inno Setup 6](https://jrsoftware.org/isinfo.php): `./build-release.ps1` writes `dist\AudioSwitch-Setup-<version>.exe` and prints its SHA-256. Pushing a `v*` tag that matches `VERSION` makes the Release workflow build it on GitHub and publish the release.
 
 ## Checking it works
 
@@ -110,7 +110,7 @@ What to tell IT about each file:
   - Captures the default playback device with WASAPI loopback and serves it on TCP 8080 to clients on the LAN. No window and no admin rights.
   - Logs to `%APPDATA%\ElTheLedge\AudioOverIP\logs`.
 
-Neither one contacts the internet. The release exes are built by the public GitHub Actions Release workflow from the tagged source, so each release has fixed file hashes IT can allow-list. The installer's hash is in the release's `SHA256SUMS.txt`. A build from source makes different hashes, so allow-list by path in that case: `%USERPROFILE%\Tools\AudioSwitch\AudioSwitch.exe` and `...\sender\AudioOverIP-headless.exe`.
+Neither one contacts the internet. The release exes are built by the public GitHub Actions Release workflow from the tagged source, so each release has fixed file hashes IT can allow-list. GitHub lists the installer's SHA-256 on the release page. A build from source makes different hashes, so allow-list by path in that case: `%USERPROFILE%\Tools\AudioSwitch\AudioSwitch.exe` and `...\sender\AudioOverIP-headless.exe`.
 
 ## Layout
 
